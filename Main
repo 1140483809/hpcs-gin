@@ -1,0 +1,295 @@
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"github.com/gin-gonic/gin"
+	"io"
+	"log"
+	"os"
+	"strings"
+	"sync"
+)
+
+const (
+	filePath = "./users.data"
+	key = "XXX"
+)
+
+type User struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+type userHash map[string]string
+
+type Checker struct {
+	uh userHash	// 用户信息
+	registerUsers []User // 注册了但未保存的用户
+}
+
+func main() {
+	engine := gin.Default()
+
+	defer fix()
+	checker := Checker{}
+	var err error
+	checker.uh, err = initUsers()
+	if err != nil {
+		return
+	}
+
+	//http://localhost:8080/user
+	routegroup := engine.Group("/user")
+
+	//http://localhost:8080/user/register 注册
+	routegroup.POST("/register", checker.register)
+
+	//http://localhost:8080/user/login    登录
+	routegroup.POST("/login", checker.login)
+
+	//http://localhost:8080/user/:id      删除
+	routegroup.DELETE("/:id", checker.delet)
+
+	//http://localhost:8080/user/revise   修改密码
+	routegroup.POST("/revise",checker.revise)
+
+	engine.Run()
+}
+//http://localhost:8080/user/register
+func (c *Checker) register(context *gin.Context) {
+	defer fix()
+	fullpath := "用户注册" + context.FullPath()
+	fmt.Println(fullpath)
+	//var c Checker
+	var user User
+	if err := context.BindJSON(&user); err != nil {
+		log.Fatal(err.Error())
+		return
+	}
+	if _, ok := c.uh[user.Username]; ok {
+		context.Writer.WriteString("用户名已被占用")
+		return
+	}
+	name := user
+	fmt.Println(name)
+	if len(user.Password) <= 6 {
+		context.Writer.WriteString("密码长度应大于六位")
+		return
+	}
+	c.registerUsers = append(c.registerUsers, User{
+		Username: user.Username,
+		Password: user.Password,
+	})
+	fmt.Println(c.registerUsers)
+	if len(c.registerUsers) > 10 {
+		go c.Save()
+	}
+	c.uh[user.Username] = user.Password
+	context.Writer.WriteString("注册成功")
+	c.Save()
+}
+
+func (c *Checker)login(context *gin.Context) {
+	fullpath := "用户登录" + context.FullPath()
+	fmt.Println(fullpath)
+	var user User
+	if err := context.BindJSON(&user); err != nil {
+		log.Fatal(err.Error())
+		return
+	}
+
+	if _, ok := c.uh[user.Username]; !ok {
+		context.Writer.WriteString("查无此人")
+		return
+	}
+	if c.uh[user.Username] != user.Password {
+		context.Writer.WriteString("用户名密码错误")
+		return
+	}
+
+	fmt.Println(user.Username + user.Password)
+	context.Writer.WriteString("登录成功")
+}
+
+func (c *Checker)delet(context *gin.Context) {
+	defer fix()
+	fullpath := "用户删除" + context.FullPath()
+	var user User
+	user.Username = context.Param("id")
+	fmt.Println(fullpath+"  "+user.Username)
+	if _,ok := c.uh[user.Username]; !ok{
+		context.Writer.WriteString("查无此人")
+		return
+	}
+	delete(c.uh,user.Username)
+	os.Remove(filePath)
+	delete(c.uh,user.Username)
+	for k,v := range c.uh{
+		defer fix()
+		c.registerUsers = append(c.registerUsers, User{
+			Username: k,
+			Password: v,
+		})
+		//go c.Save()
+		c.Save()
+	}
+	context.Writer.WriteString(fullpath+"  "+user.Username)
+}
+
+func (c *Checker) Save() {
+	defer fix()
+	fail := saveUsers(c.registerUsers)
+	c.registerUsers = fail
+}
+
+func (c *Checker) revise(context *gin.Context) {
+	defer fix()
+	fullpath := "修改密码" + context.FullPath()
+	fmt.Println(fullpath)
+	var user User
+	if err := context.BindJSON(&user); err != nil {
+		log.Fatal(err.Error())
+		return
+	}
+
+	if _, ok := c.uh[user.Username]; !ok {
+		context.Writer.WriteString("查无此人")
+		return
+	}
+	if len(user.Password) <= 6 {
+		context.Writer.WriteString("新密码长度应大于六位")
+		return
+	}
+	os.Remove(filePath)
+	for k,v := range c.uh{
+		defer fix()
+		if k==user.Username{
+			v=user.Password
+			delete(c.uh,k)
+			c.uh[k]=v
+		}
+		c.registerUsers = append(c.registerUsers, User{
+			Username: k,
+			Password: v,
+		})
+		//go c.Save()
+		c.Save()
+	}
+	fmt.Println(user.Password)
+	context.Writer.WriteString("成功修改密码" + user.Password)
+}
+
+func initUsers() (userHash, error){
+	defer fix()
+
+	f, err := os.OpenFile(filePath, os.O_CREATE | os.O_RDWR, os.ModePerm)
+	if err != nil {
+		fmt.Println(err)
+		return nil, err
+	}
+	defer f.Close()
+
+	uh := make(userHash)
+	var wg sync.WaitGroup // WaitGroup的作用是确保所有协程都执行完毕
+	reader := bufio.NewReader(f)
+	for {
+
+		buf, err := reader.ReadBytes('\n')
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			fmt.Println(err)
+			return nil, err
+		}
+
+		wg.Add(1)
+		go func(buf []byte) {
+			defer wg.Done()
+			arr := strings.Split(string(buf), ".")
+			sign , err := base64.StdEncoding.DecodeString(arr[1])
+			if err != nil {
+				fmt.Println(err)
+				return
+			}
+
+			mac := hmac.New(sha256.New, []byte(key))
+			mac.Write([]byte(arr[0]))
+			s := mac.Sum(nil)
+			if res := bytes.Compare(sign,s); res != 0 {
+				fmt.Println("data error")
+				return
+			}
+
+			u, err := base64.StdEncoding.DecodeString(arr[0])
+			if err != nil {
+				fmt.Println(err)
+				return
+			}
+			var user User
+			err = json.Unmarshal(u, &user)
+			if err != nil {
+				fmt.Println(err)
+				return
+			}
+			uh[user.Username] = user.Password
+		}(buf)
+
+	}
+	wg.Wait()
+	return uh, nil
+}
+
+func saveUsers(users []User) (fail []User){
+	defer fix()
+
+	f, err := os.OpenFile(filePath, os.O_WRONLY | os.O_CREATE | os.O_APPEND, os.ModePerm)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	defer f.Close()
+
+	var wg sync.WaitGroup // WaitGroup的作用是确保所有协程都执行完毕
+	writer := bufio.NewWriter(f)
+	for _, user := range users{
+		wg.Add(1)
+		go func(user User) {
+			defer wg.Done()
+			buf, err := json.Marshal(user)
+			user64 := base64.StdEncoding.EncodeToString(buf)
+			if err != nil {
+				fmt.Println(err)
+				fail = append(fail, user)
+				return
+			}
+
+			mac := hmac.New(sha256.New, []byte(key))
+			mac.Write([]byte(user64))
+			s := mac.Sum(nil)
+			signature := base64.StdEncoding.EncodeToString(s)
+
+			n, err := writer.Write(append([]byte(user64 + "." + signature), byte('\n')))
+			if err != nil {
+				fmt.Println(n, err)
+				fail = append(fail, user)
+				return
+			}
+		} (user)
+	}
+	wg.Wait()
+	writer.Flush()
+	return
+}
+
+func fix() {
+	if err := recover(); err != nil {
+		fmt.Println(err)
+	}
+}
